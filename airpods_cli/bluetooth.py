@@ -1,8 +1,9 @@
 """
 Bluetooth / osascript bridge — Phase 4: real implementation.
 
-All device detection and mode switching goes through osascript / AppleScript.
-Works on macOS 13 (Ventura) and later with AirPods Pro or AirPods Max.
+Parses system_profiler SPBluetoothDataType output to find connected AirPods,
+reads noise control mode from com.apple.airpods plist, and writes mode changes
+back via defaults write + cfprefsd flush.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import re
 from airpods_cli import config
 from airpods_cli.utils import run_osascript
 
+# ── Mode maps ──────────────────────────────────────────────────────────────────
 _MODE_TO_INT: dict[str, int] = {
     "off":          1,
     "anc":          2,
@@ -26,6 +28,8 @@ _SUPPORTED_MODELS = (
     "airpods (3rd generation)",
 )
 
+
+# ── Data shape ─────────────────────────────────────────────────────────────────
 
 class AirPodsDevice:
     """Represents a connected AirPods device."""
@@ -49,152 +53,214 @@ class AirPodsDevice:
         return f"AirPodsDevice(name={self.name!r}, mode={self.current_mode!r})"
 
 
-def _get_bluetooth_device_names() -> list[str]:
-    script = """
-        set deviceNames to {}
-        tell application "System Preferences"
-        end tell
-        do shell script "system_profiler SPBluetoothDataType 2>/dev/null | grep -A2 'Connected: Yes' | grep -v 'Connected' | grep -v '--' | awk -F: '{print $1}' | sed 's/^[ \\t]*//'"
+# ── system_profiler parser ─────────────────────────────────────────────────────
+
+def _parse_profiler_output(output: str) -> list[dict]:
     """
-    output, code = run_osascript(script)
-    if code != 0 or not output:
-        return []
-    return [line.strip() for line in output.splitlines() if line.strip()]
+    Parse system_profiler SPBluetoothDataType text output into a list of
+    device dicts with keys: name, connected, services, battery, model.
 
-
-def _get_device_model(device_name: str) -> str:
-    script = f"""
-        do shell script "system_profiler SPBluetoothDataType 2>/dev/null | grep -A10 '{device_name}' | grep 'Minor Type' | head -1 | awk -F: '{{print $2}}' | sed 's/^[ \\t]*//'"
+    Handles the real macOS format where:
+    - Devices are grouped under 'Connected:' / 'Not Connected:' section headers
+    - Device names are indented with variable leading spaces and end with ':'
+    - A device may appear twice (BLE-only case entry + full audio entry)
+      We keep the entry with the most data (Left/Right battery, Services with HFP)
     """
-    output, code = run_osascript(script)
-    if code == 0 and output:
-        return output.strip()
+    devices: dict[str, dict] = {}  # name → best entry so far
 
-    name_lower = device_name.lower()
-    if "pro" in name_lower:
-        return "AirPods Pro"
-    if "max" in name_lower:
-        return "AirPods Max"
-    if "airpods" in name_lower:
-        return "AirPods"
-    return device_name
+    in_connected_section = False
+    current_name: str | None = None
+    current_block: dict = {}
 
+    # Determine indent level of section headers like "Connected:" and "Not Connected:"
+    # Device names are indented one level deeper than those headers.
+    # We use a flexible indent matcher instead of hard-coding spaces.
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        leading = len(line) - len(line.lstrip())
+
+        # ── Section headers ──────────────────────────────────────────────────
+        if stripped in ("Connected:", "Not Connected:"):
+            # Save previous device block before switching section
+            if current_name and current_block:
+                _merge_device(devices, current_name, current_block, in_connected_section)
+            current_name = None
+            current_block = {}
+            in_connected_section = (stripped == "Connected:")
+            continue
+
+        # ── Device name lines ────────────────────────────────────────────────
+        # A device name line ends with ':' and is NOT a known key:value pair.
+        # Known keys contain ':' mid-line (e.g. "Address: XX:XX") — device
+        # names either have no ':' before the trailing one, or the name itself
+        # contains an apostrophe but not a key pattern.
+        if stripped.endswith(":") and ":" not in stripped[:-1].replace("'", ""):
+            # Flush previous device
+            if current_name and current_block:
+                _merge_device(devices, current_name, current_block, in_connected_section)
+            current_name = stripped[:-1]  # strip trailing ':'
+            current_block = {"leading": leading}
+            continue
+
+        # ── Key: value lines inside a device block ───────────────────────────
+        if current_name and ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            current_block[key] = val
+
+    # Flush last block
+    if current_name and current_block:
+        _merge_device(devices, current_name, current_block, in_connected_section)
+
+    # Return only connected devices
+    return [d for d in devices.values() if d.get("connected")]
+
+
+def _merge_device(store: dict, name: str, block: dict, connected: bool) -> None:
+    """
+    Merge a device block into the store, preferring the richer entry.
+    AirPods appear twice (BLE case + full audio). We keep the one
+    with Left Battery Level data and HFP in services.
+    """
+    entry = {
+        "name":      name,
+        "connected": connected,
+        "services":  block.get("Services", ""),
+        "minor":     block.get("Minor Type", ""),
+        "left":      _parse_pct(block.get("Left Battery Level", "")),
+        "right":     _parse_pct(block.get("Right Battery Level", "")),
+        "case":      _parse_pct(block.get("Case Battery Level", "")),
+    }
+
+    if name not in store:
+        store[name] = entry
+        return
+
+    # Prefer entry with Left/Right battery data (i.e. the full audio entry)
+    existing = store[name]
+    if entry["left"] is not None and existing["left"] is None:
+        store[name] = entry
+    # Also prefer entry with HFP services (more capable entry)
+    elif "HFP" in entry["services"] and "HFP" not in existing["services"]:
+        store[name] = entry
+
+
+def _parse_pct(val: str) -> int | None:
+    """Parse '100%' → 100, return None if not a percentage string."""
+    m = re.match(r"(\d+)%", val.strip())
+    return int(m.group(1)) if m else None
+
+
+# ── Mode read/write ────────────────────────────────────────────────────────────
 
 def _get_noise_control_mode(device_name: str) -> str:
-    script = f"""
-        do shell script "defaults read com.apple.airpods 2>/dev/null | grep -A5 '{device_name}' | grep NoiseControlMode | head -1 | awk '{{print $3}}' | tr -d ';'"
     """
+    Read current noise control mode from com.apple.airpods plist.
+    Tries defaults read first, then plutil as fallback.
+    Returns an internal key ("anc", "transparency", "adaptive", "off").
+    """
+    # Attempt 1: defaults read
+    script = (
+        f'do shell script "defaults read com.apple.airpods 2>/dev/null'
+        f' | grep -A5 \\"{device_name}\\"'
+        f' | grep NoiseControlMode | head -1'
+        f' | awk \'{{print $3}}\' | tr -d \';\'"'
+    )
     output, code = run_osascript(script)
-
     if code == 0 and output.strip().isdigit():
-        mode_int = int(output.strip())
-        return _INT_TO_MODE.get(mode_int, "off")
+        return _INT_TO_MODE.get(int(output.strip()), "off")
 
-    script2 = f"""
-        do shell script "plutil -p ~/Library/Preferences/com.apple.airpods.plist 2>/dev/null | grep -A3 '{device_name}' | grep NoiseControlMode | awk '{{print $3}}'"
-    """
+    # Attempt 2: plutil
+    script2 = (
+        f'do shell script "plutil -p ~/Library/Preferences/com.apple.airpods.plist 2>/dev/null'
+        f' | grep -A3 \\"{device_name}\\"'
+        f' | grep NoiseControlMode | awk \'{{print $3}}\'"'
+    )
     output2, code2 = run_osascript(script2)
     if code2 == 0 and output2.strip().isdigit():
-        mode_int = int(output2.strip())
-        return _INT_TO_MODE.get(mode_int, "off")
+        return _INT_TO_MODE.get(int(output2.strip()), "off")
 
     return "off"
 
 
-def _get_battery(device_name: str) -> dict:
-    script = f"""
-        do shell script "system_profiler SPBluetoothDataType 2>/dev/null | grep -A20 '{device_name}'"
-    """
-    output, code = run_osascript(script)
-    if code != 0 or not output:
-        return {}
-
-    battery: dict[str, int] = {}
-
-    left_match  = re.search(r"Left:\s*(\d+)%",  output, re.IGNORECASE)
-    right_match = re.search(r"Right:\s*(\d+)%", output, re.IGNORECASE)
-    case_match  = re.search(r"Case:\s*(\d+)%",  output, re.IGNORECASE)
-
-    if left_match:
-        battery["left"]  = int(left_match.group(1))
-    if right_match:
-        battery["right"] = int(right_match.group(1))
-    if case_match:
-        battery["case"]  = int(case_match.group(1))
-
-    return battery
-
-
 def _set_noise_control_mode(device_name: str, mode_key: str) -> bool:
+    """
+    Write the noise control mode to com.apple.airpods plist via defaults write,
+    then flush cfprefsd so the AirPods pick up the change.
+    Returns True on success.
+    """
     mode_int = _MODE_TO_INT.get(mode_key)
     if mode_int is None:
         return False
 
-    write_script = f"""
-        do shell script "defaults write com.apple.airpods \\\"{device_name}\\\" -dict-add NoiseControlMode -int {mode_int} && killall -HUP cfprefsd"
-    """
-    _, code = run_osascript(write_script)
-    if code == 0:
-        return True
+    # Escape the device name for the shell (handles apostrophes like "meow's")
+    escaped = device_name.replace("'", "'\\''")
 
-    return False
+    script = (
+        f"do shell script \"defaults write com.apple.airpods '{escaped}'"
+        f" -dict-add NoiseControlMode -int {mode_int}"
+        f" && killall -HUP cfprefsd\""
+    )
+    _, code = run_osascript(script)
+    return code == 0
 
+
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def get_connected_airpods() -> list[AirPodsDevice]:
-    script = """
-        do shell script "system_profiler SPBluetoothDataType 2>/dev/null"
     """
+    Return all connected AirPods devices found via system_profiler.
+    Filters to devices whose name contains 'airpods' (case-insensitive).
+    """
+    script = 'do shell script "system_profiler SPBluetoothDataType 2>/dev/null"'
     output, code = run_osascript(script)
     if code != 0 or not output:
         return []
 
-    devices: list[AirPodsDevice] = []
-    current_name: str | None = None
-    connected = False
+    parsed = _parse_profiler_output(output)
+    result = []
 
-    for line in output.splitlines():
-        stripped = line.strip()
+    for entry in parsed:
+        name = entry["name"]
+        if "airpods" not in name.lower():
+            continue
 
-        if re.match(r"^\s{6,10}\S.*:$", line) and not stripped.startswith("Address") \
-                and not stripped.startswith("Battery") and not stripped.startswith("Minor"):
-            if current_name and connected and "airpods" in current_name.lower():
-                model   = _get_device_model(current_name)
-                mode    = _get_noise_control_mode(current_name)
-                battery = _get_battery(current_name)
-                devices.append(AirPodsDevice(
-                    name=current_name,
-                    model=model,
-                    current_mode=mode,
-                    battery=battery,
-                ))
+        # Build model string from Minor Type, or fall back to name heuristic
+        minor = entry.get("minor", "")
+        if minor and minor.lower() not in ("headphones", "headset"):
+            model = minor
+        else:
+            name_lower = name.lower()
+            if "pro" in name_lower:
+                model = "AirPods Pro"
+            elif "max" in name_lower:
+                model = "AirPods Max"
+            else:
+                model = "AirPods"
 
-            current_name = stripped.rstrip(":")
-            connected = False
+        battery = {}
+        if entry["left"]  is not None: battery["left"]  = entry["left"]
+        if entry["right"] is not None: battery["right"] = entry["right"]
+        if entry["case"]  is not None: battery["case"]  = entry["case"]
 
-        elif stripped == "Connected: Yes":
-            connected = True
-        elif stripped == "Connected: No":
-            connected = False
+        mode = _get_noise_control_mode(name)
+        result.append(AirPodsDevice(name=name, model=model, current_mode=mode, battery=battery))
 
-    if current_name and connected and "airpods" in current_name.lower():
-        model   = _get_device_model(current_name)
-        mode    = _get_noise_control_mode(current_name)
-        battery = _get_battery(current_name)
-        devices.append(AirPodsDevice(
-            name=current_name,
-            model=model,
-            current_mode=mode,
-            battery=battery,
-        ))
-
-    return devices
+    return result
 
 
 def get_current_mode(device: AirPodsDevice) -> str:
+    """Return the live current mode by querying the plist directly."""
     return _get_noise_control_mode(device.name)
 
 
 def set_mode(device: AirPodsDevice, mode_key: str) -> bool:
+    """Switch the device to mode_key. Returns True on success."""
     ok = _set_noise_control_mode(device.name, mode_key)
     if ok:
         device.current_mode = mode_key
@@ -202,6 +268,9 @@ def set_mode(device: AirPodsDevice, mode_key: str) -> bool:
 
 
 def get_default_device() -> AirPodsDevice | None:
+    """
+    Return the configured default device, or the first connected AirPods.
+    """
     devices = get_connected_airpods()
     if not devices:
         return None
