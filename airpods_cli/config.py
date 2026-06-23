@@ -1,7 +1,6 @@
 """Read and write persistent user config at ~/.airpods.json."""
 
 import json
-import os
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".airpods.json"

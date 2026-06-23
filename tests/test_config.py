@@ -1,7 +1,5 @@
 """Tests for config read/write logic."""
 
-import json
-from pathlib import Path
 from unittest.mock import patch
 
 from airpods_cli.config import DEFAULT_CONFIG, load_config, save_config, set_value

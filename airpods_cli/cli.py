@@ -120,7 +120,7 @@ def config_cmd(device: str | None, toggle_order: str | None, reset: bool, show: 
 
     if show:
         cfg = config.load_config()
-        click.echo(f"  Config file:   ~/.airpods.json")
+        click.echo("  Config file:   ~/.airpods.json")
         click.echo(f"  Default device: {cfg.get('default_device') or click.style('not set', fg='bright_black')}")
         click.echo(f"  Toggle order:   {' \u2192 '.join(cfg.get('toggle_order', []))}")
         return

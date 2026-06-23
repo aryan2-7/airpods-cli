@@ -1,6 +1,6 @@
 """Tests for CLI commands using Click's test runner."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
@@ -58,6 +58,7 @@ def test_mode_no_device_connected():
 def test_mode_toggle_cycles():
     device = AirPodsDevice("Test", "AirPods Pro", current_mode="anc")
     with patch("airpods_cli.bluetooth.get_default_device", return_value=device), \
+         patch("airpods_cli.bluetooth.get_current_mode", return_value="anc"), \
          patch("airpods_cli.bluetooth.set_mode", return_value=True):
         result = CliRunner().invoke(cli, ["mode", "toggle"])
     assert result.exit_code == 0
