@@ -1,3 +1,5 @@
+# Devlopment halted for now
+
 # airpods-cli
 
 Switch your AirPods listening mode from the terminal.
@@ -131,6 +133,7 @@ On first run, macOS may ask for Accessibility or Bluetooth permissions. Grant th
 - macOS only — this uses AppleScript to talk to Bluetooth preferences
 - Does not work over SSH (requires a GUI session)
 - AirPods must be connected to the Mac running the command
+- Litreally doesnt even work rn
 
 ## Contributing
 
