@@ -1,2 +1,4 @@
 # airpods-cli
 Switch AirPods listening modes (ANC, Transparency, Adaptive, Off) from your terminal
+
+# Devlopment halted for now
