@@ -1,5 +1,8 @@
 # Devlopment halted for now
 
+### Apple has made it quite difficult to work on the mode switching feature, I've tried multiple different ways to do this but it has gotten nowhere, right now the `airpods status` and `airpods devices` works but no real mode switching does, maybe I'll come back to this someday to work on it with a different approach 
+
+
 # airpods-cli
 
 Switch your AirPods listening mode from the terminal.
@@ -22,7 +25,7 @@ airpods status            # Show current mode + device
 > Regular AirPods (1st/2nd gen) and EarPods do not support listening modes.
 
 ## Install
-
+<!--
 ```bash
 pipx install airpods-cli
 ```
@@ -32,6 +35,8 @@ Or with pip:
 ```bash
 pip install airpods-cli
 ```
+-->
+Just clone for now to test, not published anywhere
 
 ## Usage
 
